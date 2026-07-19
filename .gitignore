@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+d2a/d2o/config.yaml
+d2a/d2o/state.json

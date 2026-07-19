@@ -1,0 +1,10 @@
+destination: obsidian
+default_interval_hours: 1
+default_timezone: "Asia/Seoul"
+obsidian:
+  target_folder: "path/to/your/vault/Sources"
+  frontmatter:
+    tags: []
+  callout: |
+    > [!info] Status
+    > Downloaded, pending review

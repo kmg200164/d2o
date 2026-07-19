@@ -1,0 +1,42 @@
+name: D2O Download
+
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: d2o-download
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r d2a/requirements.txt
+
+      - name: Run Discord -> Obsidian download
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
+        run: python -m d2a.d2o.main
+
+      - name: Commit changes
+        run: |
+          git config user.name "d2a-bot"
+          git config user.email "d2a-bot@users.noreply.github.com"
+          git add -A -- . ':!.github'
+          git diff --cached --quiet || git commit -m "chore: D2O download $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git pull --rebase origin main
+          git push
