@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 
 import yaml
 
@@ -13,6 +14,61 @@ from d2a.core.scheduler import should_download_now
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
 STATE_PATH = os.path.join(os.path.dirname(__file__), "state.json")
+
+
+def resolve_repo_path(root: str | Path, relative: str | Path, label: str) -> Path:
+    root_path = Path(root).resolve()
+    relative_path = Path(relative)
+    if relative_path.is_absolute():
+        raise ValueError(f"{label} must be a relative path")
+
+    resolved = (root_path / relative_path).resolve()
+    if resolved != root_path and root_path not in resolved.parents:
+        raise ValueError(f"{label} must stay inside destination root")
+    return resolved
+
+
+def load_runtime_from_env(env=os.environ) -> tuple[dict, Path, Path]:
+    destination_root = Path(env["D2O_DESTINATION_ROOT"]).resolve()
+    target_folder = env["D2O_TARGET_FOLDER"]
+    state_path = env["D2O_STATE_PATH"]
+    resolve_repo_path(destination_root, target_folder, "target folder")
+    resolved_state_path = resolve_repo_path(destination_root, state_path, "state path")
+
+    try:
+        frontmatter = json.loads(env.get("D2O_FRONTMATTER_JSON", "{}"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("D2O_FRONTMATTER_JSON must be valid JSON") from exc
+    if not isinstance(frontmatter, dict):
+        raise ValueError("D2O_FRONTMATTER_JSON must be a JSON object")
+
+    interval_hours = int(env.get("D2O_DEFAULT_INTERVAL_HOURS", "1"))
+    if interval_hours <= 0:
+        raise ValueError("D2O_DEFAULT_INTERVAL_HOURS must be positive")
+
+    config = {
+        "destination": "obsidian",
+        "default_interval_hours": interval_hours,
+        "default_timezone": env.get("D2O_DEFAULT_TIMEZONE", "Asia/Seoul"),
+        "obsidian": {
+            "target_folder": Path(target_folder).as_posix(),
+            "frontmatter": frontmatter,
+            "callout": env.get("D2O_CALLOUT", ""),
+        },
+    }
+    return config, destination_root, resolved_state_path
+
+
+def find_vault_root(start: str | Path) -> Path:
+    current = Path(start).resolve()
+    candidates = [current.parent, *current.parents]
+    for candidate in candidates:
+        marker = candidate / ".git"
+        if (candidate / "CLAUDE.md").is_file() and (
+            marker.is_file() or marker.is_dir()
+        ):
+            return candidate
+    raise RuntimeError(f"vault root not found from {current}")
 
 
 def load_config(path: str = CONFIG_PATH) -> dict:
@@ -44,6 +100,7 @@ def normalize_channel_state(raw, config: dict) -> dict:
 
 
 def save_state(state: dict, path: str = STATE_PATH) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -97,15 +154,28 @@ def run_download(config: dict, state: dict, channel_id: str, guild_id: str, toke
 
 
 def _main() -> None:
-    config = load_config()
-    state = load_state()
+    if os.environ.get("D2O_DESTINATION_ROOT"):
+        config, destination_root, state_path = load_runtime_from_env()
+    else:
+        # Legacy in-vault execution. Removed after every caller moves to the public engine.
+        config = load_config(os.environ.get("D2O_CONFIG") or CONFIG_PATH)
+        destination_root = find_vault_root(__file__)
+        state_path = Path(STATE_PATH)
+    state = load_state(str(state_path))
 
     token = os.environ["DISCORD_BOT_TOKEN"]
     channel_id = os.environ["DISCORD_CHANNEL_ID"]
     guild_id = os.environ["DISCORD_GUILD_ID"]
-    vault_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
-    run_download(config, state, channel_id, guild_id, token, vault_root)
+    run_download(
+        config,
+        state,
+        channel_id,
+        guild_id,
+        token,
+        str(destination_root),
+        state_saver=lambda snapshot: save_state(snapshot, str(state_path)),
+    )
     print("download complete")
 
 
@@ -192,12 +262,9 @@ if __name__ == "__main__":
         normalized_missing = normalize_channel_state(None, fake_config_for_normalize)
         assert normalized_missing == {"last_message_id": None, "interval_hours": 6, "timezone": "Asia/Seoul"}, normalized_missing
 
-        # _main()'s vault_root must resolve to the actual repo root (main.py sits 3
-        # levels below it in this repo: repo_root/d2a/d2o/main.py), or notes silently
-        # get written into a phantom folder that never gets git-committed.
-        real_vault_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        assert os.path.isfile(os.path.join(real_vault_root, "LICENSE")), (
-            f"vault_root miscalculated: {real_vault_root} has no LICENSE"
-        )
+        # _main() must discover the vault root by markers instead of assuming a
+        # fixed project depth, including inside a linked worktree where .git is a file.
+        real_vault_root = find_vault_root(__file__)
+        assert (real_vault_root / "CLAUDE.md").is_file(), real_vault_root
 
         print("main.py self-check OK")

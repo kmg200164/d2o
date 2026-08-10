@@ -1,0 +1,81 @@
+name: D2O reusable collector
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        type: string
+        required: true
+      target_folder:
+        type: string
+        required: true
+      frontmatter_json:
+        type: string
+        required: true
+      callout:
+        type: string
+        required: false
+        default: ''
+      default_interval_hours:
+        type: string
+        required: false
+        default: '1'
+      default_timezone:
+        type: string
+        required: false
+        default: Asia/Seoul
+    secrets:
+      discord_bot_token:
+        required: false
+      discord_channel_id:
+        required: false
+      discord_guild_id:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    env:
+      D2O_ENABLED_CHANNEL_ID: ${{ secrets.discord_channel_id }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Collect with D2O
+        uses: kmg200164/d2o@v1
+        with:
+          profile: ${{ inputs.profile }}
+          target_folder: ${{ inputs.target_folder }}
+          frontmatter_json: ${{ inputs.frontmatter_json }}
+          callout: ${{ inputs.callout }}
+          default_interval_hours: ${{ inputs.default_interval_hours }}
+          default_timezone: ${{ inputs.default_timezone }}
+          discord_bot_token: ${{ secrets.discord_bot_token }}
+          discord_channel_id: ${{ secrets.discord_channel_id }}
+          discord_guild_id: ${{ secrets.discord_guild_id }}
+
+      - name: Commit collected messages and state
+        if: env.D2O_ENABLED_CHANNEL_ID != ''
+        shell: bash
+        env:
+          D2O_PROFILE: ${{ inputs.profile }}
+          D2O_TARGET_FOLDER: ${{ inputs.target_folder }}
+        run: |
+          git config user.name "d2o-bot"
+          git config user.email "d2o-bot@users.noreply.github.com"
+          git add -- "$D2O_TARGET_FOLDER" ".d2o/$D2O_PROFILE-state.json"
+          if git diff --cached --quiet; then
+            echo "No D2O changes"
+            exit 0
+          fi
+          git commit -m "chore: D2O collect $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

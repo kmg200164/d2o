@@ -1,0 +1,59 @@
+name: D2O Collect
+description: Collect one Discord channel into the caller repository
+
+inputs:
+  profile:
+    description: Stable profile name used for the caller-owned state file
+    required: true
+  target_folder:
+    description: Repository-relative destination folder
+    required: true
+  frontmatter_json:
+    description: JSON object merged into every generated note frontmatter
+    required: true
+  callout:
+    description: Markdown inserted above the Discord message body
+    required: false
+    default: ''
+  default_interval_hours:
+    description: Default collection interval in hours
+    required: false
+    default: '1'
+  default_timezone:
+    description: Default IANA timezone
+    required: false
+    default: Asia/Seoul
+  discord_bot_token:
+    description: Discord bot token supplied by the caller workflow secret
+    required: true
+  discord_channel_id:
+    description: Discord channel ID supplied by the caller workflow secret
+    required: true
+  discord_guild_id:
+    description: Discord guild ID supplied by the caller workflow secret
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install D2O dependencies
+      if: ${{ inputs.discord_channel_id != '' }}
+      shell: bash
+      run: python -m pip install -r "$GITHUB_ACTION_PATH/d2a/requirements.txt"
+
+    - name: Collect Discord messages
+      if: ${{ inputs.discord_channel_id != '' }}
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}
+        DISCORD_BOT_TOKEN: ${{ inputs.discord_bot_token }}
+        DISCORD_CHANNEL_ID: ${{ inputs.discord_channel_id }}
+        DISCORD_GUILD_ID: ${{ inputs.discord_guild_id }}
+        D2O_DESTINATION_ROOT: ${{ github.workspace }}
+        D2O_TARGET_FOLDER: ${{ inputs.target_folder }}
+        D2O_STATE_PATH: ${{ format('.d2o/{0}-state.json', inputs.profile) }}
+        D2O_FRONTMATTER_JSON: ${{ inputs.frontmatter_json }}
+        D2O_CALLOUT: ${{ inputs.callout }}
+        D2O_DEFAULT_INTERVAL_HOURS: ${{ inputs.default_interval_hours }}
+        D2O_DEFAULT_TIMEZONE: ${{ inputs.default_timezone }}
+      run: python -m d2a.d2o.main
