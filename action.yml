@@ -23,6 +23,10 @@ inputs:
     description: Default IANA timezone
     required: false
     default: Asia/Seoul
+  include_threads:
+    description: Collect active and archived public thread replies with per-thread cursors
+    required: false
+    default: 'false'
   discord_bot_token:
     description: Discord bot token supplied by the caller workflow secret
     required: true
@@ -56,4 +60,5 @@ runs:
         D2O_CALLOUT: ${{ inputs.callout }}
         D2O_DEFAULT_INTERVAL_HOURS: ${{ inputs.default_interval_hours }}
         D2O_DEFAULT_TIMEZONE: ${{ inputs.default_timezone }}
+        D2O_INCLUDE_THREADS: ${{ inputs.include_threads }}
       run: python -m d2a.d2o.main
