@@ -8,7 +8,15 @@ import yaml
 
 from d2a.d2o.obsidian_destination import ObsidianDestination
 from d2a.core.commands import extract_commands
-from d2a.core.discord_fetcher import COMMAND_EMOJI, CONTENT_EMOJI, fetch_new_messages, mark_processed
+from d2a.core.discord_fetcher import (
+    COMMAND_EMOJI,
+    CONTENT_EMOJI,
+    fetch_message,
+    fetch_new_messages,
+    fetch_thread_messages,
+    fetch_threads,
+    mark_processed,
+)
 from d2a.core.message import Message
 from d2a.core.scheduler import should_download_now
 
@@ -56,6 +64,8 @@ def load_runtime_from_env(env=os.environ) -> tuple[dict, Path, Path]:
             "callout": env.get("D2O_CALLOUT", ""),
         },
     }
+    if env.get("D2O_INCLUDE_THREADS", "false").lower() in {"1", "true", "yes"}:
+        config["include_threads"] = True
     return config, destination_root, resolved_state_path
 
 
@@ -92,11 +102,14 @@ def normalize_channel_state(raw, config: dict) -> dict:
     elif raw is None:
         raw = {}
 
-    return {
+    normalized = {
         "last_message_id": raw.get("last_message_id"),
         "interval_hours": raw.get("interval_hours") or config["default_interval_hours"],
         "timezone": raw.get("timezone") or config["default_timezone"],
     }
+    if config.get("include_threads"):
+        normalized["threads"] = raw.get("threads") or {}
+    return normalized
 
 
 def save_state(state: dict, path: str = STATE_PATH) -> None:
@@ -107,7 +120,9 @@ def save_state(state: dict, path: str = STATE_PATH) -> None:
 
 def run_download(config: dict, state: dict, channel_id: str, guild_id: str, token: str,
              vault_root: str, fetch_fn=fetch_new_messages, adapter=None,
-             state_saver=save_state, mark_fn=mark_processed, now=None) -> dict:
+             state_saver=save_state, mark_fn=mark_processed, now=None,
+             fetch_threads_fn=fetch_threads, fetch_thread_messages_fn=fetch_thread_messages,
+             fetch_message_fn=fetch_message) -> dict:
     """Checks the channel's interval/timezone and exits immediately (no API call)
     if it's not time yet. If it is, fetches -> splits out commands (!interval/
     !timezone) -> only content messages go to adapter.download() -> every message
@@ -149,6 +164,53 @@ def run_download(config: dict, state: dict, channel_id: str, guild_id: str, toke
         state[channel_id] = channel_state
         state_saver(state)
         mark_fn(channel_id, message.id, token, emoji)
+
+    if not config.get("include_threads"):
+        return state
+
+    thread_states = channel_state.setdefault("threads", {})
+    threads = fetch_threads_fn(parent_channel_id=channel_id, guild_id=guild_id, token=token)
+    for thread in threads:
+        previous = thread_states.get(thread.id)
+        after_id = previous.get("last_message_id") if previous else None
+        starter = None
+        if previous is None:
+            starter = fetch_message_fn(
+                channel_id=channel_id,
+                message_id=thread.id,
+                guild_id=guild_id,
+                token=token,
+            )
+
+        replies = fetch_thread_messages_fn(
+            thread_id=thread.id,
+            guild_id=guild_id,
+            token=token,
+            after_id=after_id,
+        )
+
+        if previous is None and not replies:
+            adapter.download_thread(thread, [], starter=starter)
+            thread_states[thread.id] = {
+                "last_message_id": thread.id,
+                "name": thread.name,
+                "archived": thread.archived,
+            }
+            state[channel_id] = channel_state
+            state_saver(state)
+            continue
+
+        for reply in replies:
+            adapter.download_thread(thread, [reply], starter=starter)
+            starter = None
+            thread_states[thread.id] = {
+                "last_message_id": reply.id,
+                "name": thread.name,
+                "archived": thread.archived,
+            }
+            state[channel_id] = channel_state
+            state_saver(state)
+            mark_fn(thread.id, reply.id, token, CONTENT_EMOJI)
 
     return state
 
