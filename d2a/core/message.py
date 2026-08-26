@@ -10,6 +10,15 @@ class Attachment:
 
 
 @dataclass
+class DiscordThread:
+    id: str
+    name: str
+    parent_id: str
+    archived: bool
+    jump_url: str | None = None
+
+
+@dataclass
 class Message:
     id: str
     content: str
@@ -17,6 +26,7 @@ class Message:
     timestamp: str  # ISO8601
     attachments: list[Attachment]
     jump_url: str
+    channel_id: str | None = None
 
 
 if __name__ == "__main__":
