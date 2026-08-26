@@ -4,6 +4,7 @@ import html
 import os
 import re
 import shutil
+import tempfile
 from datetime import date
 from uuid import uuid4
 
@@ -87,6 +88,10 @@ def build_frontmatter(message, obsidian_cfg: dict) -> str:
     fm = dict(obsidian_cfg["frontmatter"])
     fm["created"] = date.fromisoformat(message.timestamp[:10])
     fm["source"] = find_first_url(message.content) or message.jump_url
+    fm["discord_source"] = message.jump_url
+    fm["discord_message_id"] = message.id
+    if message.channel_id:
+        fm["discord_channel_id"] = message.channel_id
     body = yaml.dump(fm, allow_unicode=True, sort_keys=False).strip()
     return f"---\n{body}\n---"
 
@@ -184,7 +189,7 @@ def _write_note_with_name(message, obsidian_cfg: dict, target_folder: str, name:
 
 def write_note(message, config: dict, vault_root: str, existing_names: set[str],
                 downloader=download_attachment, file_opener=open,
-                text_fetcher=fetch_attachment_text) -> str:
+                text_fetcher=fetch_attachment_text, title_fetcher=extract_title) -> str:
     """Saves one message as an Obsidian note and returns the filename used
     (without extension). Uses the note-folder+Attachments pattern when there are
     attachments, a flat .md otherwise (vault_rules.md convention).
@@ -194,7 +199,7 @@ def write_note(message, config: dict, vault_root: str, existing_names: set[str],
     propagate to stop the batch."""
     obsidian_cfg = config["obsidian"]
     target_folder = os.path.join(vault_root, obsidian_cfg["target_folder"])
-    name = generate_filename(message, existing_names)
+    name = generate_filename(message, existing_names, title_fetcher=title_fetcher)
 
     try:
         return _write_note_with_name(
@@ -221,6 +226,115 @@ class ObsidianDestination(Destination):
         for message in messages:
             name = write_note(message, self.config, self.vault_root, existing_names)
             existing_names.add(name)
+
+    @staticmethod
+    def _note_paths(target_folder: str):
+        if not os.path.isdir(target_folder):
+            return []
+        paths = []
+        for current, directories, filenames in os.walk(target_folder):
+            directories[:] = [name for name in directories if name != "Attachments"]
+            paths.extend(
+                os.path.join(current, filename)
+                for filename in filenames
+                if filename.endswith(".md")
+            )
+        return paths
+
+    @staticmethod
+    def _split_note(text: str) -> tuple[dict, str]:
+        match = re.match(r"^---\n(.*?)\n---\n?", text, re.DOTALL)
+        if not match:
+            return {}, text
+        return yaml.safe_load(match.group(1)) or {}, text[match.end():]
+
+    @staticmethod
+    def _serialize_note(frontmatter: dict, body: str) -> str:
+        dumped = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False).strip()
+        return f"---\n{dumped}\n---\n{body.lstrip()}"
+
+    @staticmethod
+    def _atomic_write(path: str, text: str) -> None:
+        directory = os.path.dirname(path)
+        descriptor, staging = tempfile.mkstemp(prefix=".d2o-note-", dir=directory)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            os.replace(staging, path)
+        finally:
+            if os.path.exists(staging):
+                os.unlink(staging)
+
+    def _find_thread_note(self, target_folder: str, thread, starter=None) -> str | None:
+        starter_source = find_first_url(starter.content) if starter else None
+        source_match = None
+        for note_path in self._note_paths(target_folder):
+            with open(note_path, encoding="utf-8") as handle:
+                frontmatter, _ = self._split_note(handle.read())
+            if str(frontmatter.get("discord_message_id", "")) == thread.id:
+                return note_path
+            if starter_source and frontmatter.get("source") == starter_source:
+                source_match = note_path
+        return source_match
+
+    @staticmethod
+    def _render_reply(reply) -> str:
+        attachments = "\n".join(
+            f"- [{attachment.filename}]({attachment.url})" for attachment in reply.attachments
+        )
+        parts = [
+            f"<!-- d2o-message:{reply.id} -->",
+            f"**{reply.author} · {reply.timestamp}**",
+            reply.content,
+        ]
+        if attachments:
+            parts.append(attachments)
+        return "\n\n".join(part for part in parts if part).rstrip()
+
+    def download_thread(self, thread, messages: list, starter=None) -> None:
+        """Adds new thread replies to the parent Raw note without duplication.
+
+        New notes match by Discord starter ID. Legacy notes fall back to the
+        starter's external source URL, which enables one-time backlog recovery.
+        """
+        target_folder = os.path.join(self.vault_root, self.config["obsidian"]["target_folder"])
+        note_path = self._find_thread_note(target_folder, thread, starter=starter)
+        if note_path is None:
+            if starter is None:
+                raise RuntimeError(f"parent note not found for Discord thread {thread.id}")
+            existing_names = self._scan_existing_names(target_folder)
+            name = write_note(starter, self.config, self.vault_root, existing_names)
+            flat = os.path.join(target_folder, f"{name}.md")
+            nested = os.path.join(target_folder, name, f"{name}.md")
+            note_path = flat if os.path.isfile(flat) else nested
+
+        with open(note_path, encoding="utf-8") as handle:
+            frontmatter, body = self._split_note(handle.read())
+
+        frontmatter["discord_message_id"] = thread.id
+        if starter:
+            frontmatter["discord_source"] = starter.jump_url
+            if starter.channel_id:
+                frontmatter["discord_channel_id"] = starter.channel_id
+        frontmatter["discord_thread_id"] = thread.id
+        frontmatter["discord_thread"] = thread.name
+        if thread.jump_url:
+            frontmatter["discord_thread_source"] = thread.jump_url
+
+        start_marker = f"<!-- d2o-thread:{thread.id}:start -->"
+        end_marker = f"<!-- d2o-thread:{thread.id}:end -->"
+        if start_marker not in body:
+            transcript = f"{start_marker}\n## Discord 원문 스크립트\n\n{end_marker}"
+            body = f"{body.rstrip()}\n\n{transcript}\n"
+
+        for message in messages:
+            marker = f"<!-- d2o-message:{message.id} -->"
+            if marker in body:
+                continue
+            rendered = self._render_reply(message)
+            body = body.replace(end_marker, f"{rendered}\n\n{end_marker}", 1)
+
+        self._atomic_write(note_path, self._serialize_note(frontmatter, body))
 
     @staticmethod
     def _scan_existing_names(target_folder: str) -> set:
