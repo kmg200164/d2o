@@ -2,17 +2,36 @@
 
 import requests
 
-from d2a.core.message import Attachment, Message
+from d2a.core.message import Attachment, DiscordThread, Message
 
 DISCORD_API = "https://discord.com/api/v10"
 CONTENT_EMOJI = "%E2%9C%85"  # ✅ -- message downloaded as a note
 COMMAND_EMOJI = "%E2%9A%99"  # ⚙ -- message recognized as a command (!interval/!timezone)
 
 
+def _headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bot {token}"}
+
+
+def _message_from_raw(raw: dict, channel_id: str, guild_id: str) -> Message:
+    return Message(
+        id=raw["id"],
+        content=raw.get("content", ""),
+        author=raw["author"]["username"],
+        timestamp=raw["timestamp"],
+        attachments=[
+            Attachment(url=attachment["url"], filename=attachment["filename"])
+            for attachment in raw.get("attachments", [])
+        ],
+        jump_url=f"https://discord.com/channels/{guild_id}/{channel_id}/{raw['id']}",
+        channel_id=channel_id,
+    )
+
+
 def fetch_new_messages(channel_id: str, guild_id: str, token: str, after_id: str | None) -> list[Message]:
     """Fetches messages after after_id in the given channel, oldest first.
     Excludes bot messages and empty messages (no text and no attachments)."""
-    headers = {"Authorization": f"Bot {token}"}
+    headers = _headers(token)
     collected: list[Message] = []
     cursor = after_id
 
@@ -39,18 +58,7 @@ def fetch_new_messages(channel_id: str, guild_id: str, token: str, after_id: str
             raw_attachments = raw.get("attachments", [])
             if not content and not raw_attachments:
                 continue
-            collected.append(
-                Message(
-                    id=raw["id"],
-                    content=content,
-                    author=raw["author"]["username"],
-                    timestamp=raw["timestamp"],
-                    attachments=[
-                        Attachment(url=a["url"], filename=a["filename"]) for a in raw_attachments
-                    ],
-                    jump_url=f"https://discord.com/channels/{guild_id}/{channel_id}/{raw['id']}",
-                )
-            )
+            collected.append(_message_from_raw(raw, channel_id, guild_id))
 
         # Discord returns at most 100 per page -> fewer than 100 means no more messages.
         # Exactly 100 means another page may exist -> advance cursor to page[0]["id"] and keep polling.
@@ -61,6 +69,89 @@ def fetch_new_messages(channel_id: str, guild_id: str, token: str, after_id: str
     return collected
 
 
+def fetch_message(channel_id: str, message_id: str, guild_id: str, token: str) -> Message:
+    """Fetches one specific message, used to recover a thread's starter provenance."""
+    resp = requests.get(
+        f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}",
+        headers=_headers(token),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return _message_from_raw(resp.json(), channel_id, guild_id)
+
+
+def _thread_from_raw(raw: dict, guild_id: str) -> DiscordThread:
+    metadata = raw.get("thread_metadata") or {}
+    return DiscordThread(
+        id=raw["id"],
+        name=raw.get("name") or f"thread-{raw['id']}",
+        parent_id=raw.get("parent_id") or "",
+        archived=bool(metadata.get("archived")),
+        jump_url=f"https://discord.com/channels/{guild_id}/{raw['id']}",
+    )
+
+
+def fetch_threads(parent_channel_id: str, guild_id: str, token: str) -> list[DiscordThread]:
+    """Lists active and archived public threads owned by a parent channel.
+
+    Active threads are guild-scoped in Discord's API, so they are filtered by
+    parent_id. Archived public threads are paginated from the parent channel.
+    Duplicate IDs keep the active representation.
+    """
+    headers = _headers(token)
+    by_id: dict[str, DiscordThread] = {}
+
+    active_resp = requests.get(
+        f"{DISCORD_API}/guilds/{guild_id}/threads/active",
+        headers=headers,
+        timeout=10,
+    )
+    active_resp.raise_for_status()
+    for raw in active_resp.json().get("threads", []):
+        if raw.get("parent_id") == parent_channel_id:
+            thread = _thread_from_raw(raw, guild_id)
+            by_id[thread.id] = thread
+
+    before = None
+    while True:
+        params: dict = {"limit": 100}
+        if before:
+            params["before"] = before
+        archived_resp = requests.get(
+            f"{DISCORD_API}/channels/{parent_channel_id}/threads/archived/public",
+            headers=headers,
+            params=params,
+            timeout=10,
+        )
+        archived_resp.raise_for_status()
+        payload = archived_resp.json()
+        raw_threads = payload.get("threads", [])
+        for raw in raw_threads:
+            if raw.get("parent_id") == parent_channel_id and raw["id"] not in by_id:
+                thread = _thread_from_raw(raw, guild_id)
+                by_id[thread.id] = thread
+        if not payload.get("has_more") or not raw_threads:
+            break
+        before = (raw_threads[-1].get("thread_metadata") or {}).get("archive_timestamp")
+        if not before:
+            break
+
+    return list(by_id.values())
+
+
+def fetch_thread_messages(thread_id: str, guild_id: str, token: str,
+                          after_id: str | None) -> list[Message]:
+    """Fetches new human-authored replies from a thread channel.
+
+    Discord can return the starter message as the first thread message. The
+    parent note already contains it, so it is excluded from the transcript.
+    """
+    return [
+        message for message in fetch_new_messages(thread_id, guild_id, token, after_id)
+        if message.id != thread_id
+    ]
+
+
 def mark_processed(channel_id: str, message_id: str, token: str, emoji: str = CONTENT_EMOJI) -> bool:
     """Leaves a reaction on a processed message. Defaults to ✅ (content downloaded);
     callers pass COMMAND_EMOJI (⚙) for command messages to tell them apart --
@@ -69,7 +160,7 @@ def mark_processed(channel_id: str, message_id: str, token: str, emoji: str = CO
     message was read as a setting change. Never raises on failure (missing
     permission, etc.) -- returns False only, since this is a nice-to-have that
     must not block the batch."""
-    headers = {"Authorization": f"Bot {token}"}
+    headers = _headers(token)
     try:
         resp = requests.put(
             f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me",
